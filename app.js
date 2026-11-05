@@ -1,329 +1,263 @@
-import { generatePlan, polygonArea, toGeoJSON, toCSV } from './planner.js';
-import { PRESET_SITES, geocode } from './geocoder.js';
-import { motionAllowed, animateNumber, pressFeedback, introSequence, morphDialog, dismissDialog, springIn } from './motion.js';
+import {generatePlan, makeRectangle, polygonArea, exportGeoJSON} from './planner.js';
+import {searchLocations, COASTAL_LOCATIONS} from './geocoder.js';
+import {SPECIES, EVIDENCE, SURVEY_FIELDS, assessSurvey} from './evidence.js';
 
-// COASTAL: real geometry, explicit assumptions, no invented habitat assessment.
-const $ = id => document.getElementById(id);
-const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
-const fmt = (value, digits = 0) => new Intl.NumberFormat('en-US', {maximumFractionDigits:digits}).format(value);
-const money = value => new Intl.NumberFormat('en-US', {style:'currency',currency:'USD',minimumFractionDigits:0,maximumFractionDigits:2}).format(value);
-const clone = value => JSON.parse(JSON.stringify(value));
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-const coordinateText = ([lat,lng]) => `${Math.abs(lat).toFixed(5)}° ${lat < 0 ? 'S' : 'N'} · ${Math.abs(lng).toFixed(5)}° ${lng < 0 ? 'W' : 'E'}`;
-const SPECIES = [
-  {id:'ovalis',short:'Spoon',name:'Spoon seagrass',latin:'Halophila ovalis',descriptor:'Small, paired paddle leaves',note:'An early-colonising seagrass with paired oval leaves, found in intertidal and subtidal habitats. Verify identification, local occurrence and donor suitability before planning a transplant.'},
-  {id:'uninervis',short:'Narrowleaf',name:'Narrowleaf seagrass',latin:'Halodule uninervis',descriptor:'Slender blades with three-pointed tips',note:'A ribbon-leaved species found in shallow sandy and muddy habitats. Leaf tips have three teeth. Confirm local donor populations and conditions with a field survey.'},
-  {id:'pinifolia',short:'Fineleaf',name:'Fineleaf seagrass',latin:'Halodule pinifolia',descriptor:'Very fine ribbons with rounded tips',note:'A fine ribbon-leaved species with rounded or slightly serrated leaf tips, often found on intertidal sandbanks. Confirm identification and site suitability locally.'}
-];
-const PATTERNS = [
-  {id:'staggered',name:'Staggered',description:'Suggested start: offset rows spread structures evenly.'},
-  {id:'grid',name:'Grid',description:'Straight rows for easy measuring and repeat monitoring.'},
-  {id:'clusters',name:'Patches',description:'Groups of four, with open gaps between groups.'}
-];
-const DEFAULTS = {
-  center:[12.5880,100.9560],areaM2:400,spacingM:2,pattern:'staggered',rotationDeg:0,boundary:null,
-  unitCost:6,sparePercent:10,footprintM:.3,species:'ovalis',
-  location:{name:'Samae San coast',detail:'Chonburi, Thailand',source:'Illustrative offshore planning pin · unassessed'}
-};
-const DRAFT_KEY = 'coastal-plan-draft-v1';
-const SAVED_KEY = 'coastal-saved-plans-v1';
-let storageUnavailable = false;
-function readStorage(key, fallback) { try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; } catch { storageUnavailable = true; return fallback; } }
-function writeStorage(key, value) { try { localStorage.setItem(key,JSON.stringify(value)); return true; } catch { storageUnavailable = true; return false; } }
-function validateState(next) {
-  if (!next || typeof next !== 'object' || Array.isArray(next)) return false;
-  if (!Object.keys(DEFAULTS).every(key => next[key] !== undefined)) return false;
-  if (!Array.isArray(next.center) || next.center.length !== 2 || !SPECIES.some(s => s.id === next.species)) return false;
-  if (typeof next.location?.name !== 'string' || next.location.name.length > 150 || typeof next.location?.detail !== 'string') return false;
-  for (const [key,min,max] of [['spacingM',.5,5],['rotationDeg',0,175],['unitCost',0,10000],['sparePercent',0,100],['footprintM',.1,2],['areaM2',next.boundary ? 1 : 25,next.boundary ? 100000 : 10000]]) {
-    if (typeof next[key] !== 'number' || !Number.isFinite(next[key]) || next[key] < min || next[key] > max) return false;
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = (n,d=0) => Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
+const money = n => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2,minimumFractionDigits:0}).format(n);
+const clone = data => JSON.parse(JSON.stringify(data));
+const STORAGE = {draft:'coastal-draft-v1',plans:'coastal-plans-v1'};
+const PATTERNS = {staggered:'Staggered',square:'Grid',clusters:'Clusters'};
+const initialState = {version:1,name:'',location:{name:'Samae San',detail:'Chonburi, Thailand · unsurveyed draft',lng:100.96315,lat:12.59126},polygon:makeRectangle([100.96315,12.59126],1000),exclusions:[],speciesId:'ovalis',spacing:1.5,pattern:'staggered',orientation:0,unitCost:6,sparePercent:10,seedlingsPerStructure:1,footprintM2:0.09,coveragePercent:100,survey:{},surveyNotes:'',surveyDepth:'',basemap:'satellite'};
+function readStorage(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}}
+function writeStorage(key,value){try{localStorage.setItem(key,JSON.stringify(value));return true}catch{return false}}
+function checkedState(data){
+  if(!data || data.version!==1)throw Error('This is not a supported COASTAL plan file.');
+  const out=clone(initialState);
+  for(const key of ['spacing','orientation','unitCost','sparePercent','seedlingsPerStructure','footprintM2','coveragePercent']){if(typeof data[key]!=='number'||!Number.isFinite(data[key]))throw Error(`The plan has an invalid ${key} setting.`);out[key]=data[key]}
+  if(!['staggered','square','clusters'].includes(data.pattern))throw Error('The planting pattern is not supported.');
+  out.pattern=data.pattern;
+  if(!SPECIES.some(s=>s.id===data.speciesId))throw Error('The plan contains an unsupported seagrass species.');out.speciesId=data.speciesId;
+  out.polygon=data.polygon;out.exclusions=data.exclusions||[];
+  if(data.location&&typeof data.location.name==='string')out.location={name:data.location.name.slice(0,120),detail:String(data.location.detail||'').slice(0,200),lng:Number(data.location.lng),lat:Number(data.location.lat)};
+  out.name=String(data.name||'').slice(0,120);
+  for(const f of SURVEY_FIELDS)out.survey[f.id]=['yes','no','unknown'].includes(data.survey?.[f.id])?data.survey[f.id]:'unknown';
+  out.surveyNotes=String(data.surveyNotes||'').slice(0,5000);out.surveyDepth=String(data.surveyDepth||'').slice(0,30);
+  out.basemap=data.basemap==='map'?'map':'satellite';
+  const validated=generatePlan(out);
+  const origin=validated.polygon[0][0];
+  out.location.lng=lngWrap(validated.polygon.reduce((sum,p)=>sum+origin+lngWrap(p[0]-origin),0)/validated.polygon.length);
+  out.location.lat=validated.polygon.reduce((sum,p)=>sum+p[1],0)/validated.polygon.length;
+  return out;
+}
+let state=clone(initialState);
+try{const stored=readStorage(STORAGE.draft,null);if(stored)state=checkedState(stored)}catch{}
+let plan=null,validPlan=false,updateTimer,toastTimer,searchController,searchGeneration=0;
+let savedPlans=readStorage(STORAGE.plans,[]);if(!Array.isArray(savedPlans))savedPlans=[];
+let mode=null,drawPoints=[],pendingLocation=null;
+let activeGuide='methods';
+const icons=()=>window.lucide?.createIcons();
+
+const map=L.map('map',{zoomControl:false,preferCanvas:true,minZoom:3,maxZoom:21,attributionControl:true,doubleClickZoom:true}).setView([state.location.lat,state.location.lng],18);
+map.attributionControl.setPrefix(false);
+const satellite=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19,attribution:'Imagery © Esri, Maxar, Earthstar Geographics, GIS User Community',crossOrigin:true});
+const coastmap=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:21,maxNativeZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',crossOrigin:true});
+let basemap=state.basemap==='map'?coastmap:satellite;basemap.addTo(map);
+let tileFailures=0;
+for(const layer of [satellite,coastmap]){
+  layer.on('tileerror',()=>{if(map.hasLayer(layer)&&++tileFailures>=3)$('#map-error').hidden=false});
+  layer.on('tileload',()=>{if(map.hasLayer(layer)){tileFailures=0;$('#map-error').hidden=true}});
+}
+L.control.scale({imperial:false,maxWidth:75,position:'bottomleft'}).addTo(map);
+const boundaries=L.layerGroup().addTo(map),positions=L.layerGroup().addTo(map),exclusionLayer=L.layerGroup().addTo(map),drawing=L.layerGroup().addTo(map);
+const canvas=L.canvas({padding:.3});
+let drawnBoundary,areaTooltip;
+function displayLng(lng){const ref=state.polygon[0][0];return ref+lngWrap(lng-ref)}
+const ll=coords=>coords.map(([lng,lat])=>[lat,displayLng(lng)]);
+function lngWrap(n){return ((n+180)%360+360)%360-180}
+function centerOf(poly=state.polygon){const ref=poly[0][0];return [lngWrap(poly.reduce((s,p)=>s+ref+lngWrap(p[0]-ref),0)/poly.length),poly.reduce((s,p)=>s+p[1],0)/poly.length]}
+function coordinateText(lat,lng){return `${Math.abs(lat).toFixed(5)}° ${lat<0?'S':'N'} · ${Math.abs(lng).toFixed(5)}° ${lng<0?'W':'E'}`}
+function currentSpecies(){return SPECIES.find(s=>s.id===state.speciesId)||SPECIES[0]}
+function toast(message,error=false){clearTimeout(toastTimer);const node=$('#toast');node.classList.toggle('error',error);node.querySelector('span').textContent=message;node.hidden=false;toastTimer=setTimeout(()=>node.hidden=true,error?7000:4000)}
+function speciesArt(id){
+  const stems='<path d="M9 57Q23 53 45 56" fill="none" stroke="#a7b58a" stroke-width="1.3"/><path d="M12 57l-2 4m12-6-1 6m12-6 2 5m6-5 3 5" stroke="#b7b58c" stroke-width=".8"/>';
+  const oval='<g stroke="#669d61" stroke-width=".8"><path d="M21 55Q18 43 13 30M31 55Q31 42 34 22M39 55Q40 43 45 36" fill="none"/><ellipse cx="12" cy="30" rx="5" ry="10" transform="rotate(-26 12 30)" fill="#89b870"/><ellipse cx="33" cy="22" rx="5.6" ry="11" transform="rotate(13 33 22)" fill="#75a95b"/><ellipse cx="44" cy="35" rx="4" ry="8" transform="rotate(25 44 35)" fill="#9ac27d"/><path d="M9 23l6 14m20-23-4 17m16 0-5 10" fill="none" stroke="#b6d49b"/></g>';
+  const grass='<g fill="none" stroke-linecap="round"><path d="M17 55Q9 34 14 12" stroke="#87b16d" stroke-width="2.4"/><path d="M20 55Q17 29 25 8" stroke="#5b9b5c" stroke-width="2.5"/><path d="M25 55Q30 35 30 17" stroke="#9dbf72" stroke-width="2"/><path d="M34 55Q31 31 39 14" stroke="#74a966" stroke-width="2.4"/><path d="M36 55Q43 36 42 23" stroke="#99bc78" stroke-width="2"/></g>';
+  return `<svg viewBox="0 0 55 65" aria-hidden="true">${stems}${id==='ovalis'?oval:grass}</svg>`;
+}
+function renderControls(){
+  $('#site-name').textContent=state.location.name;$('#site-detail').textContent=state.location.detail;
+  $('#area-input').value=+(polygonArea(state.polygon)/($('#area-unit').value==='ha'?10000:1)).toFixed($('#area-unit').value==='ha'?4:1);
+  for(const [id,key] of [['spacing-input','spacing'],['coverage-input','coveragePercent'],['orientation-input','orientation'],['cost-input','unitCost'],['spares-input','sparePercent'],['plants-input','seedlingsPerStructure'],['footprint-input','footprintM2']])$('#'+id).value=state[key];
+  const species=currentSpecies();$('#species-common').textContent=species.common;$('#species-latin').textContent=species.latin;$('#species-tag').textContent=species.tag;$('#species-illustration').innerHTML=speciesArt(species.id);
+  $$('.pattern-option').forEach(b=>{const on=b.dataset.pattern===state.pattern;b.classList.toggle('selected',on);b.setAttribute('aria-pressed',on)});
+  $('#coverage-output').innerHTML=`${state.coveragePercent}<span>%</span>`;
+  $('#coverage-input').style.background=`linear-gradient(to right,var(--teal) ${(state.coveragePercent-10)/90*100}%,#e3ebe4 ${(state.coveragePercent-10)/90*100}%)`;
+  $$('.basemap-options button').forEach(b=>b.classList.toggle('selected',b.dataset.basemap===state.basemap));
+  $('#clear-exclusions').hidden=!state.exclusions.length;
+  const c=centerOf();$('#coordinate-label').textContent=coordinateText(c[1],c[0]);
+  updateSurveyCard();updateSavedCount();icons();
+}
+function renderMap(){
+  boundaries.clearLayers();positions.clearLayers();exclusionLayer.clearLayers();
+  drawnBoundary=L.polygon(ll(state.polygon),{color:'#bef5cf',weight:2.3,opacity:1,fillColor:'#49d3aa',fillOpacity:.16,interactive:false}).addTo(boundaries);
+  for(const ring of state.exclusions)L.polygon(ll(ring),{color:'#e4b47b',weight:1.5,dashArray:'5 5',fillColor:'#e4a55c',fillOpacity:.2,interactive:false}).addTo(exclusionLayer);
+  if(plan&&validPlan){
+    const radius=plan.structureCount>3000?1.9:plan.structureCount>1000?2.6:3.1;
+    for(const p of plan.points)L.circleMarker([p.lat,displayLng(p.lng)],{radius,color:'#e3ffee',weight:.85,fillColor:'#26b89b',fillOpacity:.95,renderer:canvas,bubblingMouseEvents:false}).bindPopup(`<strong>COASTAL ${esc(p.id)}</strong><br>${esc(currentSpecies().latin)}<br><span>${p.lat.toFixed(7)}, ${p.lng.toFixed(7)}</span><br>Row ${p.row} · Position ${p.col}<br>${state.seedlingsPerStructure} planting unit${state.seedlingsPerStructure===1?'':'s'}`).addTo(positions);
+    const top=state.polygon.reduce((best,p)=>p[1]>best[1]?p:best,state.polygon[0]);
+    areaTooltip=L.tooltip({permanent:true,direction:'top',offset:[0,-15],className:'map-area-label',interactive:false}).setLatLng([top[1],displayLng(top[0])]).setContent(`<strong>${esc(state.location.name)} · planting area</strong><span>${fmt(plan.areaM2)} m² &nbsp; / &nbsp; ${fmt(plan.structureCount)} structures</span>`).addTo(boundaries);
   }
-  try { generatePlan(next); return true; } catch { return false; }
+  syncLayers();resizeStructureMarkers();
 }
-const stored = readStorage(DRAFT_KEY,null);
-let state = validateState(stored) ? stored : clone(DEFAULTS);
-let committedState = clone(state);
-const storedPlans = readStorage(SAVED_KEY,[]);
-let savedPlans = (Array.isArray(storedPlans) ? storedPlans : []).filter(p => typeof p?.id === 'string' && validateState(p.state)).slice(0,50);
-let plan, calcTimer, toastTimer, searchController, searchSequence = 0;
-let mode = 'explore', drawingPoints = [], layoutMode = false, mapErrors = 0;
-let boundaryLayer, centerMarker, modalOrigin;
-const species = () => SPECIES.find(s => s.id === state.species);
-const pattern = () => PATTERNS.find(p => p.id === state.pattern);
+function resizeStructureMarkers(){const lat=centerOf()[1],mpp=156543.03392*Math.cos(lat*Math.PI/180)/2**map.getZoom(),radius=Math.max(.65,Math.min(3.2,state.spacing/mpp*.25));positions.eachLayer(layer=>layer.setRadius?.(radius))}
+function syncLayers(){for(const [input,group] of [['show-boundary',boundaries],['show-structures',positions]]){if($('#'+input).checked){if(!map.hasLayer(group))group.addTo(map)}else map.removeLayer(group)}}
+function renderSummary(){
+  if(!plan||!validPlan){$('#plan-summary').classList.add('invalid');$('#stat-structures').textContent='—';$('#stat-plants').textContent='—';$('#stat-cost').textContent='—';$('#stat-area').textContent='—';$('#summary-footnote').textContent='Resolve the plan settings to calculate a valid layout.';return}
+  $('#plan-summary').classList.remove('dirty','invalid');
+  $('#summary-subtitle').textContent=`${PATTERNS[state.pattern]} layout · ${fmt(state.spacing,2)} m spacing`;
+  $('#stat-area').innerHTML=`${fmt(plan.targetAreaM2)} <small>m²</small>`;
+  $('#stat-area-sub').textContent=`${state.coveragePercent}% of usable area`;
+  $('#stat-structures').textContent=fmt(plan.structureCount);$('#stat-spares').textContent=`+ ${fmt(plan.spares)} spare${plan.spares===1?'':'s'} · ${fmt(plan.procurementCount)} total`;
+  $('#stat-plants').textContent=fmt(plan.seedlings);$('#stat-plants-sub').textContent=`${state.seedlingsPerStructure} planting unit${state.seedlingsPerStructure===1?'':'s'} per structure`;
+  $('#stat-cost').textContent=money(plan.totalCost);$('#stat-cost-sub').textContent=`${money(state.unitCost)} each · including spares`;
+  $('#summary-footnote').textContent=plan.structureCount===0?'No structures fit. Increase the area or adjust spacing and exclusions.':'Layout estimate · confirm local habitat and conditions before planting.';
+}
+function recalculate({fit=false,notify=false}={}){
+  clearTimeout(updateTimer);
+  try{plan=generatePlan(state);validPlan=true;$('#plan-error').hidden=true;writeStorage(STORAGE.draft,state);renderControls();renderMap();renderSummary();if(fit)fitSite();if(notify)toast(`${fmt(plan.structureCount)} structure positions calculated. ${fmt(plan.procurementCount)} structures including spares.`);return true}
+  catch(error){validPlan=false;$('#plan-error').textContent=error.message;$('#plan-error').hidden=false;positions.clearLayers();renderSummary();if(notify)toast(error.message,true);return false}
+}
+function scheduleCalculation(){validPlan=false;$('#plan-summary').classList.add('dirty');clearTimeout(updateTimer);updateTimer=setTimeout(()=>recalculate(),180)}
+function fitSite(){
+  const mobile=innerWidth<=760;const small=innerWidth<=1000;
+  map.fitBounds(L.latLngBounds(ll(state.polygon)),{paddingTopLeft:mobile?[62,120]:[innerWidth>=1500?430:innerWidth<=1230?375:410,115],paddingBottomRight:mobile?[65,310]:[small?85:160,small?305:230],maxZoom:19,animate:true});
+}
+function updateSavedCount(){const count=savedPlans.length;$('#saved-count').textContent=count;$('#saved-count').hidden=!count}
+function updateSurveyCard(){const result=assessSurvey(state.survey);$('#survey-status').textContent=result.status==='survey'?'Get to know your site.':result.title;$('#survey-description').textContent=result.status==='survey'?`${result.verifiedCount} of ${SURVEY_FIELDS.length} observations verified. A field survey comes first.`:result.summary;$('#survey-button').innerHTML=`${result.status==='survey'?'Check site conditions':'Review field observations'}<i data-lucide="arrow-up-right"></i>`}
+function setSite(point,name,detail){
+  const area=polygonArea(state.polygon);state.polygon=makeRectangle([lngWrap(point.lng),point.lat],area);state.exclusions=[];state.survey={};state.surveyNotes='';state.surveyDepth='';state.name='';state.location={name:name||'Selected coastal site',detail:detail||coordinateText(point.lat,point.lng),lng:lngWrap(point.lng),lat:point.lat};cancelMode();recalculate({fit:true});toast('Planting area placed. Check habitat and field conditions at this new location.');
+}
+function setBasemap(type){map.removeLayer(basemap);basemap=type==='map'?coastmap:satellite;basemap.addTo(map);state.basemap=type;tileFailures=0;$('#map-error').hidden=true;writeStorage(STORAGE.draft,state);renderControls()}
 
-function speciesArt(type) {
-  const leaves = type === 'ovalis'
-    ? '<path d="M29 55V20m0 21-10-8m10-3 10-8m-10 4-7-8" stroke="#718e4e" stroke-width="1.8" fill="none"/><ellipse cx="17" cy="31" rx="5.3" ry="9" transform="rotate(-42 17 31)" fill="#9bbd63"/><ellipse cx="41" cy="20" rx="5.5" ry="9" transform="rotate(38 41 20)" fill="#87b25c"/><ellipse cx="21" cy="16" rx="4" ry="7" transform="rotate(-30 21 16)" fill="#b1ca78"/><path d="m29 53-10 4m10-4 11 4" stroke="#ac9e70" stroke-width="1.5"/>'
-    : type === 'uninervis'
-      ? '<path d="M29 56C13 43 16 21 10 9c10 9 11 34 19 44C24 28 34 18 33 4c6 19-3 34-2 49C40 37 42 20 51 14c-8 17-5 29-20 42Z" fill="#8eaf5e"/><path d="M29 55c-1-21-5-33-8-42 8 14 10 27 10 42" fill="#bdd184"/>'
-      : '<path d="M29 56C18 36 22 17 15 5c9 12 6 32 16 49C27 33 34 15 31 3c6 15-1 33 1 52C37 38 36 22 47 9c-9 18-4 34-15 47Z" fill="#9bbd6c"/><path d="M30 55C17 45 15 32 11 23m20 32c12-10 16-17 18-29" fill="none" stroke="#75995b" stroke-width="1.6"/>';
-  return `<svg class="species-art" viewBox="0 0 60 64" aria-hidden="true"><ellipse cx="30" cy="58" rx="14" ry="2.4" fill="#4d785b" opacity=".1"/>${leaves}</svg>`;
+// Search runs only after submission. Suggestions below are real place references.
+function renderSearchResults(results,heading='SEARCH RESULTS'){
+  const host=$('#search-results');host.innerHTML=`<div class="menu-heading">${esc(heading)}</div>${results.length?results.map((r,i)=>`<button type="button" data-location-index="${i}"><i data-lucide="map-pin"></i><span><strong>${esc(r.name)}</strong><small>${esc(r.detail)}</small></span></button>`).join(''):'<p>No places found. Try a nearby town, Thai place name, or decimal latitude, longitude.</p>'}<p>Place references locate an area. Confirm your planting point on the map.</p>`;host.hidden=false;
+  host.querySelectorAll('[data-location-index]').forEach(button=>button.addEventListener('click',()=>chooseSearchResult(results[Number(button.dataset.locationIndex)])));icons();
 }
-function patternArt(type) {
-  let dots = '';
-  for (let row=0;row<3;row++) for(let col=0;col<5;col++) {
-    if (type==='clusters' && (row===1 || col===2)) continue;
-    dots += `<circle cx="${5+col*8+(type==='staggered' && row%2 ? 3 : 0)}" cy="${4+row*8}" r="1.8" fill="currentColor"/>`;
-  }
-  return `<svg viewBox="0 0 43 25" aria-hidden="true">${dots}</svg>`;
+function chooseSearchResult(result){
+  resetSearch();$('#search-results').hidden=true;$('#location-search').value=result.name;pendingLocation=result;
+  if(result.source==='Coordinates'||/coordinate/i.test(result.source)){try{setSite(result,result.name,result.detail)}catch(error){toast(error.message,true)}return}
+  cancelMode();pendingLocation=result;mode='place';$('#map').style.cursor='crosshair';$('#draw-toolbar').hidden=false;$('#draw-instruction').textContent='Click the map to place your planting area';$('#draw-count').textContent=`Near ${result.name} · choose a surveyed nearshore point`;$('#finish-draw').hidden=true;$('#undo-point').hidden=true;
+  map.flyTo([result.lat,result.lng],result.name.toLowerCase().includes('province')?10:14,{duration:1});$('#planner-panel').classList.remove('mobile-open');toast('Click a nearshore point on the map to position your planting area.');
 }
-$('speciesChoices').innerHTML = SPECIES.map(s=>`<button class="species-card" data-species="${s.id}" aria-pressed="false" title="${s.latin}"><span class="species-tick">${icon('check')}</span>${speciesArt(s.id)}<span class="species-name">${s.short}</span></button>`).join('');
-$('patternChoices').innerHTML = PATTERNS.map(p=>`<button class="pattern-card" data-pattern="${p.id}" aria-pressed="false">${patternArt(p.id)}<span>${p.name}</span></button>`).join('');
-$('quickLocations').innerHTML = PRESET_SITES.slice(0,3).map(s=>`<button data-site="${s.id}">${icon('pin')}${s.name}</button>`).join('');
+async function handleSearch(event){
+  event?.preventDefault();resetSearch();const query=$('#location-search').value.trim();if(!query){renderSearchResults(COASTAL_LOCATIONS,'EXPLORE A COAST');return}
+  searchController=new AbortController();const generation=searchGeneration;
+  $('#search-results').innerHTML='<p>Finding your location…</p>';$('#search-results').hidden=false;
+  try{const results=await searchLocations(query,{signal:searchController.signal});if(generation===searchGeneration)renderSearchResults(results)}
+  catch(error){if(error.name==='AbortError'||generation!==searchGeneration)return;$('#search-results').innerHTML=`<p>${esc(error.message)}</p><p>You can still enter latitude, longitude or choose a point directly on the map.</p>`}
+}
+function resetSearch(){searchController?.abort();searchGeneration++}
 
-const map = L.map('map',{zoomControl:false,attributionControl:true,minZoom:3,maxZoom:22,preferCanvas:true,worldCopyJump:true}).setView(state.center,16);
-map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
-const tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
-  maxNativeZoom:19,maxZoom:22,updateWhenIdle:true,updateWhenZooming:false,keepBuffer:1,
-  attribution:'© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'
-}).addTo(map);
-tiles.on('tileerror',()=>{ if(++mapErrors>=3 && !layoutMode) $('mapNetworkNote').hidden=false; });
-tiles.on('tileload',()=>{ mapErrors=0; $('mapNetworkNote').hidden=true; });
-L.control.scale({imperial:false,position:'bottomleft'}).addTo(map);
-map.createPane('plantingPoints').style.zIndex = '450';
-const pointRenderer = L.canvas({pane:'plantingPoints',padding:.2});
-const pointLayer = L.layerGroup().addTo(map);
-const drawingLayer = L.layerGroup().addTo(map);
-const MeasuredLayer = L.GridLayer.extend({createTile() {
-  const tile = document.createElement('canvas'); const size=this.getTileSize(); tile.width=size.x;tile.height=size.y;
-  const ctx=tile.getContext('2d'); ctx.fillStyle='#e6f0ed';ctx.fillRect(0,0,size.x,size.y);ctx.strokeStyle='#c7ddd633';ctx.lineWidth=1;
-  for(let i=0;i<=size.x;i+=32){ctx.beginPath();ctx.moveTo(i,0);ctx.lineTo(i,size.y);ctx.stroke();}
-  for(let i=0;i<=size.y;i+=32){ctx.beginPath();ctx.moveTo(0,i);ctx.lineTo(size.x,i);ctx.stroke();}
-  return tile;
-}});
-const measuredLayer = new MeasuredLayer({attribution:'Measured layout · local projection · not a surveyed site',maxZoom:22});
-
-function notify(message, action) {
-  clearTimeout(toastTimer); let toast=$('toast');
-  if($('modal').open){toast=$('modalNotice');if(!toast){toast=document.createElement('div');toast.id='modalNotice';toast.className='modal-inline-note';toast.setAttribute('role','status');document.querySelector('.modal-top').append(toast);}}
-  toast.textContent=message;
-  if(action){ const button=document.createElement('button');button.textContent=action.label;button.addEventListener('click',()=>{action.run();toast.hidden=true;},{once:true});toast.append(button); }
-  toast.hidden=false; springIn(toast,{distance:12,scale:.98,duration:400});toastTimer=setTimeout(()=>{toast.hidden=true;},action?7000:4800);
+function startDraw(type){
+  resetSearch();$('#search-results').hidden=true;cancelMode();mode=type;drawPoints=[];map.removeLayer(positions);$('#map').style.cursor='crosshair';map.doubleClickZoom.disable();$('#draw-toolbar').hidden=false;$('#draw-instruction').textContent=type==='exclusion'?'Outline an area to keep clear':'Click to draw your planting boundary';$('#draw-count').textContent='At least 3 points · click the first point to finish';$('#finish-draw').hidden=false;$('#finish-draw').disabled=true;$('#undo-point').hidden=false;$('#planner-panel').classList.remove('mobile-open');toast(type==='exclusion'?'Outline existing habitat, obstacles or an area to exclude.':'Click around the planting area, then choose Finish area.');
 }
-function setRangeFill(input) { const value=(Number(input.value)-Number(input.min))/(Number(input.max)-Number(input.min))*100;input.style.background=`linear-gradient(to right,#009c98 ${value}%,#dce9e3 ${value}%)`; }
-function syncControls() {
-  $('placeName').textContent=state.location.name; $('placeDetail').textContent=state.location.detail;
-  $('speciesLatin').textContent=species().latin; $('speciesDescriptor').textContent=species().descriptor;
-  for(const button of document.querySelectorAll('[data-species]')){const selected=button.dataset.species===state.species;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));}
-  for(const button of document.querySelectorAll('[data-pattern]')){const selected=button.dataset.pattern===state.pattern;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));}
-  for(const button of document.querySelectorAll('[data-area]')){const selected=!state.boundary && Number(button.dataset.area)===state.areaM2;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected));}
-  $('areaInput').value=Math.round(state.areaM2);$('areaInput').disabled=!!state.boundary;
-  $('areaSlider').value=clamp(Math.log(state.areaM2/25)/Math.log(400)*1000,0,1000);$('areaSlider').disabled=!!state.boundary;
-  $('areaDimensions').textContent=state.boundary?'Custom boundary':`${fmt(Math.sqrt(state.areaM2),1)} × ${fmt(Math.sqrt(state.areaM2),1)} m`;
-  $('clearBoundary').hidden=!state.boundary; $('areaHelper').textContent=state.boundary?'Area is calculated from your boundary. Draw again to change it.':'The footprint for your structures. Growth is not predicted.';
-  $('patternDescription').textContent=pattern().description;
-  $('spacingSlider').value=state.spacingM;$('spacingOutput').textContent=state.spacingM.toFixed(1)+' m';
-  $('rotationSlider').value=state.rotationDeg;$('rotationOutput').textContent=state.rotationDeg+'°';
-  $('unitCost').value=state.unitCost;$('sparePercent').value=state.sparePercent;$('footprintInput').value=state.footprintM;
-  for(const input of document.querySelectorAll('input[type=range]'))setRangeFill(input);
+function renderDrawing(){
+  drawing.clearLayers();if(drawPoints.length>=2)L.polyline(ll([...drawPoints,...(drawPoints.length>=3?[drawPoints[0]]:[])]),{color:mode==='exclusion'?'#edbc7d':'#d0ffdd',weight:2,dashArray:'5 5'}).addTo(drawing);
+  drawPoints.forEach((p,i)=>{const m=L.marker([p[1],p[0]],{icon:L.divIcon({className:`map-vertex ${mode==='exclusion'?'exclusion-vertex':''}`,iconSize:[9,9],iconAnchor:[4.5,4.5]}),bubblingMouseEvents:false}).addTo(drawing);if(i===0)m.on('click',()=>{if(drawPoints.length>=3)finishDraw()})});
+  $('#finish-draw').disabled=drawPoints.length<3;$('#draw-count').textContent=`${drawPoints.length} point${drawPoints.length===1?'':'s'} · ${drawPoints.length<3?'at least 3 needed':'click Finish area to calculate'}`;
 }
-function renderResults() {
-  animateNumber($('structureCount'),plan.count,{format:v=>fmt(Math.round(v))});
-  animateNumber($('areaCounter'),plan.areaM2,{format:v=>fmt(Math.round(v))});
-  animateNumber($('spacingCounter'),plan.spacingM,{format:v=>v.toFixed(1)});
-  animateNumber($('estimateCost'),plan.materialCost,{format:money});
-  $('resultSubtitle').textContent=`${species().name} · ${pattern().name} layout`;
-  $('sparesNote').textContent=`materials incl. ${plan.spareCount} spares (${fmt(state.sparePercent)}%)`;
-  $('plotHintArea').textContent=fmt(plan.areaM2)+' m²';$('mapCoordinates').textContent=coordinateText(plan.center);
-  const notes=[];
-  if(plan.count>1800)notes.push(`Map displays a sample of ${fmt(plan.count)} positions. Exports include every position.`);
-  if(!plan.count)notes.push('This layout produces no positions. Try another layout, spacing, or area.');
-  if(state.footprintM>state.spacingM)notes.push('Clearance envelopes overlap: increase spacing or reduce the clearance diameter.');
-  $('renderNote').textContent=notes.join(' ');$('renderNote').hidden=!notes.length;
+function finishDraw(){
+  if(drawPoints.length<3)return;const candidate=clone(state);
+  if(mode==='exclusion')candidate.exclusions.push(clone(drawPoints));else{candidate.polygon=clone(drawPoints);candidate.exclusions=[];candidate.survey={};candidate.surveyNotes='';candidate.surveyDepth='';candidate.name='';const c=centerOf(candidate.polygon);if(map.distance([state.location.lat,state.location.lng],[c[1],c[0]])>500){candidate.location.name='Drawn coastal site';candidate.location.detail=coordinateText(c[1],c[0])}candidate.location.lng=c[0];candidate.location.lat=c[1]}
+  try{generatePlan(candidate);state=candidate;cancelMode();recalculate({fit:true,notify:true})}catch(error){toast(error.message,true)}
 }
-function renderMap() {
-  if(!plan)return;
-  if(boundaryLayer)boundaryLayer.setLatLngs(plan.boundary);
-  else boundaryLayer=L.polygon(plan.boundary,{color:'#008c87',weight:2,dashArray:'6 5',fillColor:'#40c8ad',fillOpacity:.16,className:'planting-boundary',interactive:false}).addTo(map);
-  pointLayer.clearLayers();
-  const metersPerPixel=156543.03392*Math.cos(plan.center[0]*Math.PI/180)/2**map.getZoom();
-  const radius=clamp(plan.spacingM/metersPerPixel*.15,1.2,4);
-  const stride=Math.max(1,Math.ceil(plan.count/1800));
-  for(let i=0;i<plan.count;i+=stride){const p=plan.points[i];L.circleMarker([p.lat,p.lng],{radius,color:'#007b75',weight:.6,fillColor:'#16b494',fillOpacity:.9,renderer:pointRenderer}).bindPopup(`<b>${escapeHTML(p.id)}</b><br><i>${species().latin}</i><br>${coordinateText([p.lat,p.lng])}<br><small>Calculated position · field verification required</small>`).addTo(pointLayer);}
-  if(centerMarker)centerMarker.remove();
-  centerMarker=L.marker(plan.center,{draggable:!state.boundary,keyboard:true,title:'Planting plot. Drag to move a square area.',icon:L.divIcon({className:'plot-center-icon',html:'<span class="plot-pin"></span>',iconSize:[24,24],iconAnchor:[12,12]})}).addTo(map);
-  centerMarker.on('dragend',()=>{const p=centerMarker.getLatLng();apply({center:[p.lat,p.lng],location:{name:'Selected coastal point',detail:coordinateText([p.lat,p.lng]),source:'User-positioned map pin · unassessed'}});});
-  centerMarker.on('click',()=>{if(mode==='explore')fitPlot();});
-  if(map.getZoom()<19)centerMarker.bindTooltip(`<b>${fmt(plan.areaM2)} m² · ${fmt(plan.count)} structures</b><small>Planning footprint · survey needed</small>`,{permanent:true,direction:'right',offset:[15,0],className:'plot-label'}).openTooltip();
-}
-function calculate() {
-  try {
-    const next=generatePlan(state);plan=next;state.center=[...next.center];if(state.boundary)state.areaM2=next.areaM2;
-    committedState=clone(state);syncControls();renderResults();renderMap();writeStorage(DRAFT_KEY,state);return true;
-  } catch(error) {
-    state=clone(committedState);plan=generatePlan(state);syncControls();renderResults();renderMap();notify(error.message);return false;
-  }
-}
-function apply(patch,{fit=false,debounce=false}={}) {
-  state={...state,...patch};clearTimeout(calcTimer);
-  if(debounce){syncControls();calcTimer=setTimeout(calculate,55);return true;}
-  if(!calculate())return false;
-  if(motionAllowed() && ['pattern','species','areaM2','boundary'].some(key=>key in patch))map.getPane('plantingPoints').animate([{opacity:.25},{opacity:1}],{duration:520,easing:'ease-out'});
-  if(fit)fitPlot();return true;
-}
-function flush() { clearTimeout(calcTimer);return calculate(); }
-function fitPlot() {
-  if(!plan)return;map.invalidateSize();const {x:w,y:h}=map.getSize();const phone=innerWidth<=620,floating=innerWidth>1100;
-  const options={paddingTopLeft:[floating?380:Math.min(w*.12,phone?25:60),Math.min(h*.3,phone?110:175)],paddingBottomRight:[Math.min(w*.2,phone?50:100),Math.min(h*.36,phone?150:280)],maxZoom:22,duration:1.35};
-  const bounds=L.latLngBounds(plan.boundary);
-  if(motionAllowed())map.flyToBounds(bounds,options);else map.fitBounds(bounds,{...options,animate:false});
-}
-function moveToPlace(result) {
-  if(!apply({center:[result.lat,result.lng],boundary:null,areaM2:clamp(state.areaM2,25,10000),location:{name:result.name,detail:result.detail||'Selected coordinates',source:result.source||'Place search · unassessed'}}))return;
-  $('searchInput').value=result.name;$('searchResults').hidden=true;setMode('explore');
-  const zoom=/coordinates/i.test(result.source||'')?19:15;
-  map.flyTo([result.lat,result.lng],zoom,{animate:motionAllowed(),duration:1.9});
-  notify('Location found. Use Place plot to choose the exact planting footprint.');
-}
-function setMode(next) {
-  mode=next;drawingPoints=[];drawingLayer.clearLayers();$('drawToolbar').hidden=next!=='draw';
-  $('placePlotButton').classList.toggle('active',next==='place');$('placePlotButton').setAttribute('aria-pressed',String(next==='place'));
-  $('drawMapButton').classList.toggle('active',next==='draw');$('drawMapButton').setAttribute('aria-pressed',String(next==='draw'));
-  document.querySelector('.map-stage').classList.toggle('placing',next==='place');document.querySelector('.map-stage').classList.toggle('drawing',next==='draw');
-  $('mapStatusText').textContent=next==='draw'?'Add corners around your planting area':next==='place'?'Tap the map to place your plot':layoutMode?'Measured layout':'Explore your coastline';
-  if(next==='draw')map.doubleClickZoom.disable();else map.doubleClickZoom.enable();updateDrawing();
-}
-function updateDrawing() {
-  drawingLayer.clearLayers();
-  if(drawingPoints.length>1)L.polyline(drawingPoints,{color:'#008f88',weight:2,dashArray:'6 5'}).addTo(drawingLayer);
-  if(drawingPoints.length>=3)L.polygon(drawingPoints,{color:'#008f88',weight:0,fillOpacity:.12,interactive:false}).addTo(drawingLayer);
-  drawingPoints.forEach((point,i)=>L.marker(point,{icon:L.divIcon({className:'boundary-vertex',iconSize:[9,9],iconAnchor:[4.5,4.5]}),interactive:false}).addTo(drawingLayer));
-  $('finishDrawing').disabled=drawingPoints.length<3;$('undoCorner').disabled=!drawingPoints.length;
-  $('drawInstruction').textContent=drawingPoints.length?`${drawingPoints.length} corners · add more or finish`:'Tap the map to add corners';
-}
-function finishDrawing() {
-  try {
-    const area=polygonArea(drawingPoints);if(area<1||area>100000)throw new Error('Draw an area between 1 and 100,000 m². Zoom in for a small planting site.');
-    if(apply({boundary:clone(drawingPoints),areaM2:area,location:{name:'Custom planting area',detail:'Drawn boundary · field survey needed',source:'User-drawn boundary · unassessed'}},{fit:true})){setMode('explore');notify('Boundary measured. Your structure positions have been recalculated.');}
-  } catch(error){notify(error.message);}
-}
+function cancelMode(){mode=null;drawPoints=[];pendingLocation=null;drawing.clearLayers();$('#draw-toolbar').hidden=true;$('#finish-draw').hidden=false;$('#undo-point').hidden=false;$('#map').style.cursor='';map.doubleClickZoom.enable();syncLayers()}
 map.on('click',event=>{
-  const lat=event.latlng.lat,lng=((event.latlng.lng+180)%360+360)%360-180;
-  if(mode==='place'){if(apply({center:[lat,lng],boundary:null,areaM2:clamp(state.areaM2,25,10000),location:{name:'Selected coastal point',detail:coordinateText([lat,lng]),source:'User-positioned map pin · unassessed'}}))setMode('explore');}
-  else if(mode==='draw'){
-    if(drawingPoints.length>=100)return notify('A boundary can contain up to 100 corners.');
-    const point=[lat,lng];if(drawingPoints.length && map.distance(point,drawingPoints.at(-1))<.05)return;
-    drawingPoints.push(point);updateDrawing();
-  }
+  if(mode==='place'){const chosen=pendingLocation;try{setSite(event.latlng,chosen?.name,chosen?.detail)}catch(error){toast(error.message,true)}return}
+  if(mode==='boundary'||mode==='exclusion'){if(drawPoints.length>=256){toast('Use no more than 256 boundary points.',true);return}drawPoints.push([lngWrap(event.latlng.lng),event.latlng.lat]);renderDrawing();return}
+  const content=document.createElement('div');content.innerHTML=`<strong>Explore this location</strong><br><span style="color:#819b8a">${esc(coordinateText(event.latlng.lat,event.latlng.lng))}</span><br><button class="primary-button" style="margin-top:10px;font-size:10px">Place planting area here</button>`;
+  content.querySelector('button').addEventListener('click',()=>{try{setSite(event.latlng,'Selected coastal site');map.closePopup()}catch(error){toast(error.message,true)}});L.popup().setLatLng(event.latlng).setContent(content).openOn(map);
 });
-map.on('zoomend',renderMap);
+map.on('mousemove',event=>{if(mode&&mode!=='place')$('#map').style.cursor='crosshair'});
+map.on('zoomend',resizeStructureMarkers);
 
-document.querySelector('.brand').addEventListener('click',event=>{event.preventDefault();closeDialog();fitPlot();});
-$('mapNav').addEventListener('click',()=>{closeDialog();fitPlot();});
-$('speciesChoices').addEventListener('click',event=>{const b=event.target.closest('[data-species]');if(b)apply({species:b.dataset.species});});
-$('patternChoices').addEventListener('click',event=>{const b=event.target.closest('[data-pattern]');if(b)apply({pattern:b.dataset.pattern});});
-document.querySelector('.area-presets').addEventListener('click',event=>{const b=event.target.closest('[data-area]');if(b)apply({areaM2:Number(b.dataset.area),boundary:null},{fit:true});});
-$('areaSlider').addEventListener('input',event=>apply({areaM2:Math.round(25*400**(Number(event.target.value)/1000))},{debounce:true}));
-$('spacingSlider').addEventListener('input',event=>apply({spacingM:Number(event.target.value)},{debounce:true}));
-$('rotationSlider').addEventListener('input',event=>apply({rotationDeg:Number(event.target.value)},{debounce:true}));
-for(const [id,key,min,max] of [['areaInput','areaM2',25,10000],['unitCost','unitCost',0,10000],['sparePercent','sparePercent',0,100],['footprintInput','footprintM',.1,2]]) {
-  $(id).addEventListener('change',event=>{const text=event.target.value.trim(),value=Number(text);if(!text||!Number.isFinite(value)||value<min||value>max){notify(`Enter a value between ${fmt(min,2)} and ${fmt(max,2)}.`);syncControls();return;}apply({[key]:value},{fit:key==='areaM2'});});
+function openDialog(title,html,eyebrow='COASTAL WORKSPACE'){$('#dialog-title').textContent=title;$('#dialog-eyebrow').textContent=eyebrow;$('#dialog-body').innerHTML=html;$('#export-menu').hidden=true;$('#search-results').hidden=true;$('#app-dialog').showModal();icons();$('#dialog-body').scrollTop=0}
+function closeDialog(){$('#app-dialog').close()}
+function openSpecies(){
+  openDialog('Find your local species',`<p>Start with a species already documented at the site or its local reference meadow. Each choice is included in your plan and field exports.</p><div class="species-list">${SPECIES.map(s=>`<button class="species-choice ${s.id===state.speciesId?'selected':''}" data-species="${s.id}"><span class="species-illustration">${speciesArt(s.id)}</span><span><strong>${esc(s.common)}</strong><em>${esc(s.latin)}</em><p>${esc(s.description)}</p></span><i data-lucide="${s.id===state.speciesId?'circle-check':'chevron-right'}"></i></button>`).join('')}</div><div class="context-note">Species selection does not establish that a site is suitable. Planting spacing is an editable field-trial assumption, not a universal biological optimum.</div>`,'02 / CHOOSE YOUR SEAGRASS');
+  $$('#dialog-body [data-species]').forEach(b=>b.addEventListener('click',()=>{if(state.speciesId!==b.dataset.species){state.speciesId=b.dataset.species;state.survey.native='unknown'}closeDialog();recalculate();toast(`${currentSpecies().latin} selected. Confirm this species occurs locally.`)}));
 }
-$('clearBoundary').addEventListener('click',()=>apply({boundary:null,areaM2:clamp(Math.round(state.areaM2),25,10000)},{fit:true}));
-for(const id of ['drawAreaButton','drawMapButton'])$(id).addEventListener('click',()=>setMode(mode==='draw'?'explore':'draw'));
-$('placePlotButton').addEventListener('click',()=>setMode(mode==='place'?'explore':'place'));
-$('finishDrawing').addEventListener('click',finishDrawing);$('undoCorner').addEventListener('click',()=>{drawingPoints.pop();updateDrawing();});$('cancelDrawing').addEventListener('click',()=>setMode('explore'));
-$('zoomIn').addEventListener('click',()=>map.zoomIn());$('zoomOut').addEventListener('click',()=>map.zoomOut());$('fitPlot').addEventListener('click',fitPlot);$('northButton').addEventListener('click',()=>apply({rotationDeg:0}));
-$('layerButton').addEventListener('click',()=>{
-  layoutMode=!layoutMode;if(layoutMode){tiles.remove();measuredLayer.addTo(map);$('mapNetworkNote').hidden=true;fitPlot();}else{measuredLayer.remove();tiles.addTo(map);map.flyTo(plan.center,16,{animate:motionAllowed(),duration:1.2});}
-  $('layerButton').classList.toggle('active',layoutMode);$('layerButton').setAttribute('aria-pressed',String(layoutMode));$('layerButton').setAttribute('aria-label',layoutMode?'Switch to coastline map':'Switch to measured layout view');
-  document.querySelector('.leaflet-control-scale').style.display=layoutMode?'block':'';setMode('explore');
-});
-$('retryMap').addEventListener('click',()=>{mapErrors=0;$('mapNetworkNote').hidden=true;tiles.redraw();});
-$('myLocation').addEventListener('click',()=>{
-  if(!navigator.geolocation)return notify('Location access is unavailable. Search a place or enter coordinates.');
-  const button=$('myLocation');button.disabled=true;
-  navigator.geolocation.getCurrentPosition(position=>{button.disabled=false;moveToPlace({lat:position.coords.latitude,lng:position.coords.longitude,name:'Your location',detail:'Device location · choose a coastal footprint',source:'Device coordinates · unassessed'});},()=>{button.disabled=false;notify('Could not get your location. Search a place or enter latitude, longitude.');},{enableHighAccuracy:true,timeout:10000,maximumAge:60000});
-});
-function focusSearch(){ $('searchInput').focus();$('searchInput').select();springIn(document.querySelector('.map-search'),{distance:0,scale:.98,duration:380}); }
-$('locationButton').addEventListener('click',focusSearch);
-$('quickLocations').addEventListener('click',event=>{const button=event.target.closest('[data-site]');if(button)moveToPlace(PRESET_SITES.find(s=>s.id===button.dataset.site));});
-$('searchForm').addEventListener('submit',async event=>{
-  event.preventDefault();const query=$('searchInput').value.trim();if(!query)return focusSearch();
-  searchController?.abort();searchController=new AbortController();const sequence=++searchSequence;
-  const results=$('searchResults');results.hidden=false;results.innerHTML='<div class="search-message">Finding your coastline…</div>';$('searchSubmit').disabled=true;
-  try{
-    const locations=await geocode(query,{signal:searchController.signal});if(sequence!==searchSequence)return;
-    results.innerHTML=locations.length?locations.map((result,i)=>`<button class="search-result" data-result="${i}">${icon('pin')}<span><b>${escapeHTML(result.name)}</b><small>${escapeHTML(result.detail)}</small></span></button>`).join('')+'<div class="search-credit">Place names: Open-Meteo / GeoNames · not habitat data</div>':'<div class="search-message">No place found. Try a nearby town, one of the coast shortcuts, or latitude, longitude.</div>';
-    for(const button of results.querySelectorAll('[data-result]'))button.addEventListener('click',()=>moveToPlace(locations[Number(button.dataset.result)]));
-  }catch(error){if(error.name!=='AbortError'&&sequence===searchSequence)results.innerHTML=`<div class="search-message">${escapeHTML(error.message)}</div>`;}
-  finally{if(sequence===searchSequence)$('searchSubmit').disabled=false;}
-});
-document.addEventListener('pointerdown',event=>{if(!event.target.closest('.map-search-wrap'))$('searchResults').hidden=true;});
-document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!$('modal').open){$('searchResults').hidden=true;setMode('explore');}});
-$('mobileToggle').addEventListener('click',()=>{const panel=document.querySelector('.planner-panel');const collapsed=panel.classList.toggle('collapsed');$('mobileToggle').setAttribute('aria-expanded',String(!collapsed));setTimeout(()=>map.invalidateSize(),320);});
-if('ResizeObserver' in window)new ResizeObserver(()=>map.invalidateSize({pan:false})).observe($('map'));
+function openSurvey(){
+  openDialog('Get to know your site',`<p>Record observations from the actual planting area. These checks organize field evidence; they are not a validated suitability model.</p><form id="survey-form">${SURVEY_FIELDS.map(f=>`<div class="survey-field"><label for="survey-${f.id}">${esc(f.label)}</label><p>${esc(f.help)}</p><select id="survey-${f.id}" name="${f.id}"><option value="unknown"${!['yes','no'].includes(state.survey[f.id])?' selected':''}>Not assessed yet</option><option value="yes"${state.survey[f.id]==='yes'?' selected':''}>Verified — favorable for a local pilot</option><option value="no"${state.survey[f.id]==='no'?' selected':''}>Constraint identified — needs review</option></select></div>`).join('')}<div class="survey-field"><label for="survey-depth">Water depth at observation (optional)</label><p>Record the tide and timing in your notes. This value is retained, without applying a generic species threshold.</p><div class="suffix-input"><input id="survey-depth" type="number" min="0" max="100" step="0.1" placeholder="e.g. 1.2" value="${esc(state.surveyDepth)}"><span>m</span></div></div><div class="survey-field"><label for="survey-notes">Field notes & evidence</label><textarea id="survey-notes" maxlength="5000" placeholder="Survey date, tide, light measurements, donor meadow, observations…">${esc(state.surveyNotes)}</textarea></div><div id="survey-verdict" class="survey-verdict"></div><div class="dialog-actions"><button type="button" class="quiet-button" id="survey-cancel">Cancel</button><button type="submit" class="primary-button">Save observations<i data-lucide="check"></i></button></div></form>`,'FIELD ASSESSMENT');
+  const form=$('#survey-form');const readForm=()=>Object.fromEntries(SURVEY_FIELDS.map(f=>[f.id,$('#survey-'+f.id).value]));
+  function verdict(){const r=assessSurvey(readForm());$('#survey-verdict').classList.toggle('caution',r.status!=='pilot');$('#survey-verdict').innerHTML=`<strong>${esc(r.title)}</strong><p>${esc(r.summary)}</p><p>${r.verifiedCount} of ${SURVEY_FIELDS.length} observations verified.</p>`}
+  form.addEventListener('change',verdict);verdict();$('#survey-cancel').addEventListener('click',closeDialog);
+  form.addEventListener('submit',e=>{e.preventDefault();state.survey=readForm();state.surveyNotes=$('#survey-notes').value.trim();state.surveyDepth=$('#survey-depth').value;writeStorage(STORAGE.draft,state);updateSurveyCard();icons();closeDialog();toast('Field observations saved to this plan.')});
+}
+function evidenceHTML(){return EVIDENCE.map(e=>`<article class="evidence-card"><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.title)} ↗</a><small>${esc(e.authors)} · ${e.year}</small><p>${esc(e.implication)}</p></article>`).join('')}
+function openGuide(tab='methods'){
+  activeGuide=tab;
+  const methods=`<h3>A real layout, from your real boundary.</h3><p>The planner projects your geographic boundary into a local metric plane, generates structure positions, and clips them to the boundary. A clearance based on the structure footprint keeps whole units inside. Exclusions are removed from the usable area.</p><div class="formula-box">Grid area per position ≈ spacing²<br>Staggered area per position ≈ √3 / 2 × spacing²<br>Procurement = installed + ceil(installed × spare %)<br>Material estimate = procurement × unit cost</div><p>These formulas explain the patterns. The displayed count comes from the actual clipped positions, so irregular boundaries, orientation, footprint and exclusions affect the result.</p><h3>What each pattern does</h3><ul><li><strong>Staggered:</strong> a triangular lattice with the same distance to nearest neighbors. A useful geometric starting point for even spacing.</li><li><strong>Grid:</strong> aligned rows and columns for clear transects and straightforward field marking.</li><li><strong>Clusters:</strong> groups of seven structures. Group centers are four spacings apart. Incomplete edge groups are omitted.</li></ul><h3>Area, coverage and living seagrass</h3><p>The coverage slider allocates a fraction of valid planting positions, starting near the site's center. Planned area is the requested fraction of usable area; it is not measured live seagrass cover or a forecast of spread. Whole structures and whole clusters mean the achieved position fraction can differ slightly.</p><h3>Planning assumptions</h3><p>The initial 1.5 m spacing, 0.09 m² footprint, one planting unit per structure, and 10% spares are editable assumptions. The initial US$6 unit price comes from your project poster. Labor, transport, donor material, maintenance and monitoring are excluded.</p><div class="context-note">Planning limits: 100 ha per site, 15,000 structures, 10 km maximum span, latitude within ±75°. Coordinates use WGS84. Confirm final installation positions by field survey.</div><button class="primary-button" id="guide-compare">Compare layout counts<i data-lucide="arrow-right"></i></button>`;
+  const species=`<p>These species match the COASTAL project's tropical seagrass focus. The final selection should follow local species records, donor stock and site observations.</p>${SPECIES.map(s=>`<article class="evidence-card"><div class="about-brand"><span class="species-illustration">${speciesArt(s.id)}</span><div><h3 style="margin:0">${esc(s.common)}</h3><em>${esc(s.latin)}</em></div></div><p>${esc(s.description)}</p>${s.evidence.map((url,i)=>`<a class="source-link" href="${esc(url)}" target="_blank" rel="noopener">Primary evidence ${i+1} ↗</a>`).join(' · ')}</article>`).join('')}<div class="context-note">The planner does not claim a universally optimal species or spacing from coordinates. Changing a species resets its local-occurrence assessment so the new selection can be checked.</div>`;
+  const evidence=`<p>Primary literature informs the field checks and explains why species, density and local conditions matter. These studies do not validate the COASTAL device or guarantee an outcome at the selected site.</p>${evidenceHTML()}`;
+  const about=`<div class="about-brand"><img src="assets/mark.svg" alt=""><div><strong>COASTAL.</strong><small>A future rooted in seagrass</small></div></div><p>Conservation-Oriented Assisted Juvenile Seagrass Transplantation Apparatus for Littoral Restoration through Enhanced Seagrass Establishment, Wave Dissipation, and Sediment Trapping.</p><p>Inspired by mangrove anchorage and protective root structures, COASTAL brings structure-assisted planting and restoration planning into one workspace.</p><h3>Your project, translated into a working planner.</h3><p>The aqua, teal and coastal blue palette is drawn from the supplied poster. Device performance statements on that poster are project claims; they are not used to predict survival, wave reduction, carbon storage or restored habitat in this app.</p><a href="assets/coastal-poster.png" target="_blank" rel="noopener"><img class="poster-preview" src="assets/coastal-poster.png" alt="Original COASTAL project poster"></a><h3>Map and data</h3><p>Satellite imagery: Esri and its imagery providers. Coast map: OpenStreetMap contributors. Place search: Photon / OpenStreetMap. Place results are location references, not mapped seagrass or recommended habitats.</p><p>Saved plans stay in this browser. Export the complete plan to keep a portable backup or import it on another device. There is no cloud account synchronization.</p>`;
+  openDialog('The COASTAL field guide',`<div class="guide-tabs">${[['methods','Planning method'],['species','Species'],['evidence','Research'],['about','About COASTAL']].map(([key,label])=>`<button class="guide-tab ${tab===key?'active':''}" data-guide="${key}">${label}</button>`).join('')}</div>${({methods,species,evidence,about})[tab]||methods}`,'LEARN / PLAN / RESTORE');
+  $$('#dialog-body [data-guide]').forEach(b=>b.addEventListener('click',()=>openGuide(b.dataset.guide)));$('#guide-compare')?.addEventListener('click',openCalculation);
+}
+function openCalculation(){
+  if(!ensurePlan())return;
+  const comparisons=Object.keys(PATTERNS).map(pattern=>{try{const p=generatePlan({...state,pattern});return `<div><small>${PATTERNS[pattern]}</small><strong>${fmt(p.structureCount)} structures</strong><small>${money(p.totalCost)} with spares</small></div>`}catch{return `<div><small>${PATTERNS[pattern]}</small><strong>Outside limits</strong></div>`}}).join('');
+  openDialog('Every position is counted',`<p>Calculated for <strong>${esc(state.location.name)}</strong>, using your boundary, exclusions and current settings.</p><div class="calculation-grid"><div><small>Selected boundary</small><strong>${fmt(plan.areaM2,1)} m²</strong></div><div><small>Usable after exclusions</small><strong>${fmt(plan.usableAreaM2,1)} m²</strong></div><div><small>Requested planting area</small><strong>${fmt(plan.targetAreaM2,1)} m²</strong></div><div><small>Allocated positions</small><strong>${fmt(plan.layoutCoveragePercent,1)}%</strong></div><div><small>Installed structures</small><strong>${fmt(plan.structureCount)}</strong></div><div><small>Order including spares</small><strong>${fmt(plan.procurementCount)}</strong></div><div><small>Nominal installed footprint</small><strong>${fmt(plan.footprintM2,2)} m²</strong></div><div><small>Boundary clearance</small><strong>${fmt(plan.boundaryClearanceM,3)} m</strong></div></div><h3>Compare patterns at ${fmt(state.spacing,2)} m spacing</h3><div class="calculation-grid">${comparisons}</div><p>Counts describe geometry, not ecological performance. Staggering produces more evenly spaced positions per unit area; this does not prove higher survival.</p><div class="context-note">${plan.warnings.map(esc).join('<br><br>')}</div><button class="primary-button" id="calculation-method">Read the planning method<i data-lucide="arrow-right"></i></button>`,'CALCULATION DETAILS');$('#calculation-method').addEventListener('click',()=>openGuide('methods'));
+}
+function openHelp(){openDialog('From coastline to planting plan',`<p>A practical workspace for planning your next COASTAL installation.</p>${[
+['Find your coast','Search a place or enter latitude, longitude. For a place search, click the map to choose the exact planting point.'],
+['Define the area','Enter square meters or hectares, or draw a custom boundary. Use the dashed-square tool to exclude existing habitat or obstacles.'],
+['Choose and calculate','Select a locally recorded species, choose a pattern and adjust structure spacing. Every generated position contributes to the count.'],
+['Check and take it to the field','Record site observations, save the plan, and export the boundary and GPS positions as GeoJSON or CSV.']].map(([title,copy],i)=>`<div class="how-step"><span>0${i+1}</span><div><h3>${title}</h3><p>${copy}</p></div></div>`).join('')}<div class="context-note">The map opens with a draft area near Samae San. It is a starting location, not a field-verified restoration site. Your edits are saved in this browser.</div><div class="dialog-actions"><button class="primary-button" id="help-start">Start planning<i data-lucide="arrow-right"></i></button></div>`,'A FUTURE ROOTED IN SEAGRASS');$('#help-start').addEventListener('click',closeDialog)}
 
-function openModal(eyebrow,html) {
-  const dialog=$('modal'),alreadyOpen=dialog.open;$('modalNotice')?.remove();$('modalEyebrow').textContent=eyebrow;$('modalContent').innerHTML=html;
-  if(!alreadyOpen){modalOrigin=document.activeElement;dialog.showModal();morphDialog(dialog,modalOrigin);}else{morphDialog(dialog,modalOrigin);springIn($('modalContent'),{distance:12,scale:.99,duration:400});}
-  dialog.scrollTop=0;
+function ensurePlan(){return validPlan||recalculate({notify:true})}
+function planName(){return state.name||`${state.location.name} · ${currentSpecies().latin}`}
+function completePlan(){return {format:'COASTAL_PLAN',version:1,savedAt:new Date().toISOString(),name:planName(),settings:clone(state),result:clone(plan),assessment:assessSurvey(state.survey),sources:EVIDENCE.map(e=>({title:e.title,url:e.url})),notes:'Geometric planning estimate. Field conditions, live cover and survival are not inferred from the map.'}}
+function openSave(){
+  if(!ensurePlan())return;
+  openDialog('Give this meadow a beginning',`<p>Save this boundary, species, layout and field observations together. Your plans are kept in this browser.</p><form id="save-form"><label for="plan-name" style="display:block;font-weight:600;font-size:11px;margin-bottom:8px">Plan name</label><input class="name-field" id="plan-name" required maxlength="120" value="${esc(state.name||`${state.location.name} restoration`)}"><div class="context-note">${fmt(plan.structureCount)} structures · ${fmt(plan.targetAreaM2)} m² planned · ${esc(currentSpecies().latin)}</div><div class="dialog-actions"><button class="quiet-button" type="button" id="save-cancel">Cancel</button><button class="primary-button" type="submit">Save plan<i data-lucide="bookmark-check"></i></button></div></form>`,'SAVE YOUR PLAN');$('#save-cancel').addEventListener('click',closeDialog);
+  $('#save-form').addEventListener('submit',event=>{event.preventDefault();state.name=$('#plan-name').value.trim();if(!state.name)return;const saved={id:crypto.randomUUID?crypto.randomUUID():String(Date.now()),...completePlan()};const next=[saved,...savedPlans];if(!writeStorage(STORAGE.plans,next)){toast('Browser storage is full or unavailable. Export the complete plan as a backup.',true);return}savedPlans=next;writeStorage(STORAGE.draft,state);updateSavedCount();closeDialog();toast('Plan saved. Find it under Saved plans.')});
 }
-function closeDialog(callback) { const dialog=$('modal');if(!dialog.open){callback?.();return;}dismissDialog(dialog,()=>{dialog.close();callback?.();}); }
-$('closeModal').addEventListener('click',()=>closeDialog());$('modal').addEventListener('cancel',event=>{event.preventDefault();closeDialog();});
-$('modal').addEventListener('click',event=>{if(event.target!==$('modal'))return;const rect=$('modal').getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)closeDialog();});
+function openSaved(){
+  openDialog('Your saved beginnings',`<p>Plans saved in this browser. Export a complete plan to keep a backup or move it to another device.</p>${savedPlans.length?savedPlans.map((p,i)=>`<article class="saved-plan-row"><h3>${esc(p.name||'Untitled plan')}</h3><p>${esc(p.settings?.location?.name||'Coastal site')} · ${fmt(p.result?.structureCount||0)} structures · ${esc(p.settings?.pattern?PATTERNS[p.settings.pattern]:'')}</p><p>${esc(new Date(p.savedAt).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}))}</p><div class="saved-actions"><button data-open-plan="${i}">Open plan</button><button data-download-plan="${i}">Export backup</button><button data-delete-plan="${i}">Delete</button></div></article>`).join(''):'<div class="empty-state"><i data-lucide="bookmark"></i><h3>Your next meadow belongs here.</h3><p>Create a planting plan, then save its layout and field observations.</p></div>'}<div class="dialog-actions"><input type="file" id="import-file" accept="application/json,.json" hidden><button class="quiet-button" id="import-plan"><i data-lucide="upload"></i>Import complete plan</button><button class="primary-button" id="saved-back">Back to map<i data-lucide="arrow-right"></i></button></div>`,'SAVED PLANS');
+  $('#saved-back').addEventListener('click',closeDialog);$('#import-plan').addEventListener('click',()=>$('#import-file').click());$('#import-file').addEventListener('change',importPlan);
+  $$('#dialog-body [data-open-plan]').forEach(b=>b.addEventListener('click',()=>{try{const loaded=checkedState(savedPlans[Number(b.dataset.openPlan)].settings);cancelMode();resetSearch();state=loaded;setBasemap(state.basemap);closeDialog();recalculate({fit:true});toast('Saved plan opened.')}catch(error){toast(error.message,true)}}));
+  $$('#dialog-body [data-download-plan]').forEach(b=>b.addEventListener('click',()=>{const p=savedPlans[Number(b.dataset.downloadPlan)];download(`${slug(p.name)}.coastal.json`,JSON.stringify(p,null,2),'application/json')}));
+  $$('#dialog-body [data-delete-plan]').forEach(b=>b.addEventListener('click',()=>{const i=Number(b.dataset.deletePlan);if(b.dataset.confirm!=='yes'){b.dataset.confirm='yes';b.textContent='Confirm delete';return}const next=savedPlans.filter((_,index)=>index!==i);if(writeStorage(STORAGE.plans,next)){savedPlans=next;updateSavedCount();openSaved();toast('Saved plan deleted.')}else toast('Browser storage is unavailable. The plan was not deleted.',true)}));
+}
+async function importPlan(event){
+  const file=event.target.files?.[0];if(!file)return;if(file.size>10*1024*1024){toast('Use a COASTAL JSON file smaller than 10 MB.',true);return}
+  try{const data=JSON.parse(await file.text());if(data.format!=='COASTAL_PLAN')throw Error('Choose a complete COASTAL plan JSON export.');const imported=checkedState(data.settings);cancelMode();resetSearch();state=imported;setBasemap(state.basemap);closeDialog();recalculate({fit:true});toast('Plan imported. Save it to add it to this browser’s saved plans.')}catch(error){toast(`Could not import: ${error.message}`,true)}
+}
+function slug(value){return String(value).normalize('NFKD').replace(/[^a-zA-Z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,80).toLowerCase()||'coastal-plan'}
+function download(name,content,type){const blob=new Blob([content],{type}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000)}
+function csvCell(value){let s=String(value??'');if(/^[=+\-@\t\r]/.test(s)&&!/^[-+]?\d+(\.\d+)?$/.test(s))s="'"+s;return /[",\r\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s}
+function exportPlan(type){
+  if(!ensurePlan())return;const base=slug(planName());const species=currentSpecies();
+  if(type==='geojson')download(base+'.geojson',JSON.stringify(exportGeoJSON(plan,{site:state.location.name,species:species.latin,plantsPerStructure:state.seedlingsPerStructure,assessment:assessSurvey(state.survey).title}),null,2),'application/geo+json');
+  if(type==='csv'){const header=['structure_id','latitude','longitude','row','column','species','planting_units','pattern','spacing_m','site','assessment'];const rows=plan.points.map(p=>[p.id,p.lat.toFixed(8),p.lng.toFixed(8),p.row,p.col,species.latin,state.seedlingsPerStructure,state.pattern,state.spacing,state.location.name,assessSurvey(state.survey).title]);download(base+'-coordinates.csv','\uFEFF'+[header,...rows].map(r=>r.map(csvCell).join(',')).join('\r\n'),'text/csv;charset=utf-8')}
+  if(type==='json')download(base+'.coastal.json',JSON.stringify(completePlan(),null,2),'application/json');
+  if(type==='print'){preparePrint();window.print()}
+  $('#export-menu').hidden=true;if(type!=='print')toast('Plan export prepared.');
+}
+function preparePrint(){
+  const result=assessSurvey(state.survey);const center=centerOf();const cos=Math.cos(center[1]*Math.PI/180);const xy=([lng,lat])=>[(center[0]+lngWrap(lng-center[0])-center[0])*cos,-lat];const pts=state.polygon.map(xy);const minX=Math.min(...pts.map(p=>p[0])),maxX=Math.max(...pts.map(p=>p[0])),minY=Math.min(...pts.map(p=>p[1])),maxY=Math.max(...pts.map(p=>p[1]));const scale=Math.min(670/(maxX-minX),250/(maxY-minY));const project=p=>{const [x,y]=xy(p);return [15+(x-minX)*scale,15+(y-minY)*scale]};
+  const svg=`<svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg"><polygon points="${state.polygon.map(p=>project(p).join(',')).join(' ')}" fill="#eaf5e7" stroke="#278d72" stroke-width="1.5"/>${state.exclusions.map(r=>`<polygon points="${r.map(p=>project(p).join(',')).join(' ')}" fill="#f8e6c9" stroke="#b88043"/>`).join('')}${plan.points.map(p=>{const [x,y]=project([p.lng,p.lat]);return `<circle cx="${x}" cy="${y}" r="1.3" fill="#238776"/>`}).join('')}</svg>`;
+  $('#print-view').innerHTML=`<h1>COASTAL · ${esc(planName())}</h1><p>${esc(state.location.detail)} · ${esc(coordinateText(center[1],center[0]))}<br>Prepared ${esc(new Date().toLocaleString())}</p>${svg}<p class="print-note">Geometric layout in local metric projection. No habitat or bathymetry is inferred.</p><table><tbody>${[['Species',currentSpecies().latin],['Boundary / usable area',`${fmt(plan.areaM2,1)} / ${fmt(plan.usableAreaM2,1)} m²`],['Planned area',`${fmt(plan.targetAreaM2,1)} m² (${state.coveragePercent}% requested)`],['Pattern / spacing / row bearing',`${PATTERNS[state.pattern]} / ${state.spacing} m / ${state.orientation}°`],['Installed / spare / order structures',`${plan.structureCount} / ${plan.spares} / ${plan.procurementCount}`],['Planting units',plan.seedlings],['Unit footprint / installed footprint',`${state.footprintM2} / ${fmt(plan.footprintM2,2)} m²`],['Materials estimate',`${money(plan.totalCost)} at ${money(state.unitCost)} per structure, including spares`],['Site assessment',result.title]].map(([a,b])=>`<tr><th>${esc(a)}</th><td>${esc(b)}</td></tr>`).join('')}</tbody></table><h2>Field observations</h2><table>${SURVEY_FIELDS.map(f=>`<tr><td>${esc(f.label)}</td><td>${({yes:'Verified',no:'Constraint identified',unknown:'Not assessed'})[state.survey[f.id]||'unknown']}</td></tr>`).join('')}</table><p>Water depth at observation: ${esc(state.surveyDepth||'Not recorded')} ${state.surveyDepth?'m':''}</p><p>${esc(state.surveyNotes||'No field notes recorded.').replace(/\n/g,'<br>')}</p><h2>Assumptions and evidence</h2><p>Structure count is generated from clipped coordinates. Planned area is not future living seagrass coverage. Unit price, footprint, spacing, planting capacity and spare percentage are editable planning assumptions. Labor, transport and monitoring are excluded.</p><p>Coordinates for all ${fmt(plan.structureCount)} structures are available in the CSV and GeoJSON exports.</p>${EVIDENCE.map(e=>`<p class="print-note">${esc(e.authors)} (${e.year}). ${esc(e.title)}. ${esc(e.url)}</p>`).join('')}`;
+}
 
-function layoutSVG() {
-  const latitude=plan.center[0]*Math.PI/180;const convert=([lat,lng])=>[(lng-plan.center[1])*111195.08*Math.cos(latitude),(lat-plan.center[0])*111195.08];
-  const boundary=plan.boundary.map(convert);const xs=boundary.map(p=>p[0]),ys=boundary.map(p=>p[1]);
-  const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
-  const scale=Math.min(440/Math.max(.001,maxX-minX),170/Math.max(.001,maxY-minY));
-  const point=([x,y])=>[280+(x-(minX+maxX)/2)*scale,125-(y-(minY+maxY)/2)*scale];
-  const path=boundary.map((p,i)=>`${i?'L':'M'}${point(p).map(n=>n.toFixed(2)).join(' ')}`).join(' ')+'Z';
-  const stride=Math.max(1,Math.ceil(plan.count/2200));const radius=clamp(plan.spacingM*scale*.14,.7,3.2);let dots='';
-  for(let i=0;i<plan.count;i+=stride){const p=plan.points[i],xy=point(convert([p.lat,p.lng]));dots+=`<circle ${plan.count<500?'class="preview-position"':''} cx="${xy[0].toFixed(2)}" cy="${xy[1].toFixed(2)}" r="${radius.toFixed(2)}" fill="#159c82" style="animation-delay:${Math.min(i,60)*6}ms"/>`;}
-  return `<div class="layout-preview"><span class="layout-badge">${pattern().name.toUpperCase()} · ${stride>1?'SAMPLED PREVIEW':'CALCULATED POSITIONS'}</span><svg viewBox="0 0 560 245" role="img" aria-label="${escapeHTML(pattern().name)} planting positions within the measured boundary"><defs><pattern id="preview-grid" width="20" height="20" patternUnits="userSpaceOnUse"><path d="M20 0H0V20" stroke="#cedfd8" stroke-width=".5" fill="none"/></pattern></defs><rect width="560" height="245" fill="url(#preview-grid)"/><path d="${path}" fill="#d2eee2" stroke="#3b9f8b" stroke-width="1.5" stroke-dasharray="5 4"/>${dots}<text x="525" y="35" fill="#4c8d7c" font-size="10" text-anchor="middle">N</text><path d="m525 44-4 11 4-3 4 3Z" fill="#4c8d7c"/><text x="280" y="232" font-size="10" fill="#6d8d81" text-anchor="middle">${fmt(plan.areaM2,1)} m² footprint · ${fmt(plan.spacingM,1)} m centre-to-centre spacing</text></svg></div>`;
-}
-const SOURCE_LIST = `<ol class="source-list">
-  <li><a href="https://doi.org/10.1016/j.marpolbul.2008.09.028" target="_blank" rel="noopener">van Katwijk et al. (2009). Guidelines for seagrass restoration.</a><small>Habitat and donor selection, risk spreading and ecosystem engineering are restoration considerations. A map pin alone cannot establish suitability.</small></li>
-  <li><a href="https://doi.org/10.1111/1365-2664.12562" target="_blank" rel="noopener">van Katwijk et al. (2016). Global analysis of seagrass restoration: the importance of large-scale planting.</a><small>Restoration outcomes depend on context and scale. This paper does not validate the app's default 2 m spacing or COASTAL structure performance.</small></li>
-  <li><a href="https://doi.org/10.3389/fmars.2021.645673" target="_blank" rel="noopener">Zhang et al. (2021). Seagrass planting arrangements and facilitation.</a><small>Experimental evidence that spatial arrangement can matter in its study system; not a calibration for these Thai species or this apparatus.</small></li>
-  <li><a href="https://doi.org/10.3390/jmse11101928" target="_blank" rel="noopener">Titioatchasai et al. (2023). Thai transplanted seagrass meadow monitoring.</a><small>Local monitoring evidence; not a site-suitability layer for this app.</small></li>
-  <li><a href="https://www.seagrasswatch.org/idseagrass/" target="_blank" rel="noopener">Seagrass-Watch: species identification.</a><small>Identification guidance for the species choices. Field confirmation is required.</small></li>
-</ol>`;
-function reportHTML(includeActions=true) {
-  const rows=[['Species',species().latin],['Pattern',pattern().name],['Spacing (centre to centre)',fmt(plan.spacingM,2)+' m'],['Row pitch',fmt(plan.rowPitchM,3)+' m'],['Layout rotation',state.rotationDeg+'°'],['Assumed circular clearance diameter',fmt(state.footprintM,2)+' m'],['Minimum centre-to-boundary clearance',fmt(plan.edgeBufferM,2)+' m'],['Structures to place',fmt(plan.count)],['Spare structures',fmt(plan.spareCount)+' ('+fmt(state.sparePercent)+'%)'],['Total structures to order',fmt(plan.orderCount)],['Unit material cost',money(state.unitCost)],['Materials including spares',money(plan.materialCost)],['Positions per 100 m²',fmt(plan.densityPer100M2,1)],['Site assessment','Pending field survey']];
-  return `<span class="modal-tag">YOUR NEXT MEADOW · PLANNING ESTIMATE</span><h2>${escapeHTML(state.location.name)}</h2><p class="modal-intro">${escapeHTML(coordinateText(plan.center))}<br>${escapeHTML(species().name)} · ${escapeHTML(pattern().name)} planting layout</p>${layoutSVG()}<div class="report-stats"><div><strong>${fmt(plan.count)}</strong><small>structures to place</small></div><div><strong>${fmt(plan.areaM2)} m²</strong><small>planting footprint</small></div><div><strong>${money(plan.materialCost)}</strong><small>materials + spares</small></div></div><table class="report-table"><tbody>${rows.map(([label,value])=>`<tr><td>${escapeHTML(label)}</td><td>${escapeHTML(value)}</td></tr>`).join('')}</tbody></table><p class="report-note">${plan.count?'Coordinates are calculated layout positions, not surveyed planting instructions.':'This layout produces no positions. A different alignment or pattern may fit; this is not proof that the area cannot be planted.'} Material cost covers structures only. Plants, labour, transport, field surveys and permits are excluded. Coverage means the planting footprint, not predicted seagrass growth.</p>${plan.warnings.length?`<p class="report-note">${plan.warnings.map(escapeHTML).join('<br>')}</p>`:''}${includeActions?`<div class="modal-actions"><button class="action-primary" data-action="save">${icon('save')}Save plan</button><button data-action="csv">${icon('download')}Positions CSV</button><button data-action="geojson">${icon('download')}GeoJSON</button><button data-action="print">Print / PDF</button></div>`:''}`;
-}
-function reviewPlan(){if(flush())openModal('PLANTING PLAN',reportHTML());}
-$('reviewButton').addEventListener('click',reviewPlan);$('exportButton').addEventListener('click',reviewPlan);
-function showScience() {
-  openModal('THE SCIENCE',`<span class="modal-tag">TRANSPARENT BY DESIGN</span><h2>A calculated layout.<br>A considered next step.</h2><p class="modal-intro">The planner calculates geometry and material quantities. Ecological suitability still needs local evidence.</p><div class="method-cards"><div class="method-card"><b>Grid</b><p>Rows and columns separated by your selected spacing s.</p></div><div class="method-card"><b>Staggered</b><p>Offset rows. Row pitch = s × √3 / 2, with equal nearest-neighbour spacing.</p></div><div class="method-card"><b>Patches</b><p>Complete groups of four. Within-group spacing s; group-centre pitch 3s.</p></div></div><h3>How the numbers are calculated</h3><p class="modal-intro">The app projects a small site onto a local plane, rotates the selected lattice, and counts positions inside the boundary. Every centre must stay at least half the assumed circular clearance diameter from an edge. It does not search every possible lattice alignment or maximise packing.</p><p class="report-note">Order quantity = placed structures + ceil(placed structures × spare percentage / 100).<br>Material estimate = order quantity × unit cost.<br>Default: 400 m², 2 m spacing, 0.30 m circular clearance, 10% spares, US$6/unit → 120 staggered positions, 132 to order, US$792.</p><h3>What the presets mean</h3><p class="modal-intro">Two-metre spacing and 0.30 m clearance are editable demonstration assumptions. US$6 is taken from the supplied COASTAL poster. The species choice changes the plan's identity and guidance; it does not silently change spacing or invent a survival forecast.</p><h3>Before planting</h3><p class="modal-intro">Confirm existing habitat and local species, donor suitability, light and depth, sediment, hydrodynamics, disturbance, permissions and a monitoring plan. Search results are place names, not approved sites. No bathymetry, tide, water-quality or habitat survey is connected.</p><h3>Method limits</h3><p class="modal-intro">The local projection is intended for small sites up to 100,000 m², within ±80° latitude, without crossing the antimeridian. There is a 50,000-position limit. Drawn boundaries must not cross themselves. Large layouts are sampled visually; CSV and GeoJSON contain every generated position.</p><h3>Research and identification</h3>${SOURCE_LIST}<h3>Map and search</h3><p class="modal-intro"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> supplies the base map; <a href="https://open-meteo.com/en/docs/geocoding-api" target="_blank" rel="noopener">Open-Meteo / GeoNames</a> supplies place search. Map clicks are user choices, not habitat assessments. The pale measured view is a generated drafting background.</p><div class="modal-actions"><button data-action="close">Back to your coast ${icon('arrow')}</button></div>`);
-}
-$('scienceNav').addEventListener('click',showScience);
-$('speciesInfo').addEventListener('click',()=>openModal('YOUR SEAGRASS',`<h2>Start with a local species.</h2><p class="modal-intro">Three species choices for the demo. Confirm identification and natural local occurrence before choosing a donor population.</p>${SPECIES.map(s=>`<div class="species-detail">${speciesArt(s.id)}<div><b>${s.name}</b><i>${s.latin}</i><p>${s.note}</p></div></div>`).join('')}<p class="report-note">Descriptions: <a href="https://www.seagrasswatch.org/idseagrass/" target="_blank" rel="noopener">Seagrass-Watch identification guide</a>. Species selection does not imply that the map location is suitable or that 2 m spacing is optimal.</p><div class="modal-actions"><button data-action="close">Choose your species ${icon('arrow')}</button></div>`));
-$('helpButton').addEventListener('click',()=>openModal('HOW IT WORKS',`<span class="modal-tag">A SMALL START. A CLEAR PLAN.</span><h2>From coast to planting plan.</h2><p class="modal-intro">A simple way to explore a layout before you head into the field.</p><div class="steps-list">${[['Find your coast','Search a town or island, choose a shortcut, or enter latitude, longitude. Select Place plot, then tap the map.'],['Choose your species','Pick Spoon, Narrowleaf or Fineleaf. Use the information button for identification guidance.'],['Set the footprint','Drag the area slider or draw a boundary. Switch between staggered, grid and patches; quantities update immediately.'],['Take your plan with you','Open View planting plan. Save locally, download every coordinate as CSV or GeoJSON, or print to PDF.']].map(([title,body],i)=>`<div class="help-step"><span>${i+1}</span><div><b>${title}</b><p>${body}</p></div></div>`).join('')}</div><p class="report-note">Use ${icon('fit')} to zoom to the plot, or ${icon('layers')} for the measured layout view. Fine-tune reveals spacing, rotation, unit cost and spares. Saved plans stay in this browser on this device; export a copy to keep or share.</p><div class="modal-actions"><button class="action-primary" data-action="close">Explore your coastline ${icon('arrow')}</button><button data-action="science">Read the methods</button></div>`));
-$('projectButton').addEventListener('click',()=>openModal('MEET COASTAL',`<span class="modal-tag">INSPIRED BY MANGROVES</span><h2>Small structure.<br>Lasting possibility.</h2><p class="modal-intro">COASTAL is the Conservation-Oriented Assisted Juvenile Seagrass Transplantation Apparatus for Littoral Restoration through Enhanced Seagrass Establishment, Wave Dissipation, and Sediment Trapping.</p><div class="method-cards"><div class="method-card"><b>Anchor</b><p>A pod-inspired anchor intended to help transplanted seagrass stay in place.</p></div><div class="method-card"><b>Protect</b><p>A root-inspired upper structure intended to dissipate wave energy.</p></div><div class="method-card"><b>Restore</b><p>A tool for planning small restoration trials and monitoring their outcomes.</p></div></div><p class="report-note">The poster below is the project's supplied reference. Its performance and maturity claims are project-reported, not independently verified here, and are not used to predict field outcomes. This app uses the poster's US$6 unit cost only as an editable assumption.</p><img src="assets/coastal-poster.png" class="poster-image" alt="Original COASTAL research poster supplied by the project team" loading="lazy"><div class="modal-actions"><button data-action="science">Read the planning methods ${icon('arrow')}</button></div>`));
-
-function updateSavedCount(){ $('savedCount').textContent=savedPlans.length;$('savedCount').hidden=!savedPlans.length; }
-function savePlan() {
-  if(!flush())return;if(savedPlans.length>=50)return notify('You have 50 saved plans. Export or remove an older plan first.');
-  const entry={id:globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(36).slice(2)}`,createdAt:new Date().toISOString(),state:clone(state),count:plan.count,cost:plan.materialCost};
-  const next=[entry,...savedPlans];if(!writeStorage(SAVED_KEY,next))return notify('This browser cannot save locally. Download CSV or GeoJSON to keep your plan.');
-  savedPlans=next;updateSavedCount();notify('Plan saved on this device.',{label:'View plans',run:showSaved});
-}
-function showSaved() {
-  const cards=savedPlans.map(entry=>{const s=SPECIES.find(s=>s.id===entry.state.species),p=generatePlan(entry.state);const date=new Date(entry.createdAt);return `<div class="saved-plan"><span class="saved-icon">${icon('leaf')}</span><div class="saved-plan-info"><h3>${escapeHTML(entry.state.location.name)}</h3><p>${escapeHTML(s.name)} · ${fmt(p.areaM2)} m² · ${fmt(p.count)} structures<br>${Number.isNaN(date.valueOf())?'Saved on this device':date.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})}</p></div><button class="load-plan" data-load="${escapeHTML(entry.id)}">Open</button><button data-delete="${escapeHTML(entry.id)}" aria-label="Delete ${escapeHTML(entry.state.location.name)}">${icon('trash')}</button></div>`;}).join('');
-  openModal('SAVED PLANS',`<h2>Your next meadows.</h2><p class="modal-intro">Saved in this browser, on this device. Export your positions to keep an independent copy.</p>${cards||`<div class="empty-state">${icon('save')}<b>Your first meadow starts here.</b><p>Set up a planting footprint, then save your plan.</p></div>`}<div class="modal-actions"><button data-action="close">Back to the map ${icon('arrow')}</button></div>`);
-}
-$('savedNav').addEventListener('click',showSaved);$('saveButton').addEventListener('click',savePlan);
-function exportPlan(type) {
-  if(!flush())return;
-  const metadata={site:state.location.name,species:species().latin,createdAt:new Date().toISOString(),status:'Unassessed planning estimate',locationSource:state.location.source||'User input',costCurrency:'USD'};
-  const content=type==='geojson'?JSON.stringify(toGeoJSON(plan,metadata),null,2):toCSV(plan,metadata);
-  const blob=new Blob([content],{type:type==='geojson'?'application/geo+json':'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob),a=document.createElement('a');
-  a.href=url;a.download=`COASTAL-${new Date().toISOString().slice(0,10)}.${type}`;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),10000);notify(`${type==='csv'?'CSV':'GeoJSON'} prepared with all ${fmt(plan.count)} structure positions.`);
-}
-function printPlan(){if(!flush())return;$('printReport').innerHTML=`<h1>COASTAL / Planting plan</h1><p>Generated ${escapeHTML(new Date().toLocaleString())} · Planning estimate, pending field survey.</p>${reportHTML(false)}<h3>Methods and sources</h3>${SOURCE_LIST}`;window.print();}
-$('modalContent').addEventListener('click',event=>{
-  const action=event.target.closest('[data-action]')?.dataset.action;
-  if(action==='save')savePlan();else if(action==='csv'||action==='geojson')exportPlan(action);else if(action==='print')printPlan();else if(action==='close')closeDialog();else if(action==='science')showScience();
-  const load=event.target.closest('[data-load]')?.dataset.load;
-  if(load){const entry=savedPlans.find(p=>p.id===load);if(entry&&validateState(entry.state)){clearTimeout(calcTimer);state=clone(entry.state);if(calculate())closeDialog(()=>{fitPlot();notify('Saved plan loaded.');});}}
-  const remove=event.target.closest('[data-delete]')?.dataset.delete;
-  if(remove){const original=[...savedPlans],next=savedPlans.filter(p=>p.id!==remove);if(!writeStorage(SAVED_KEY,next))return notify('Could not update saved plans.');savedPlans=next;updateSavedCount();showSaved();notify('Plan removed.',{label:'Undo',run:()=>{if(writeStorage(SAVED_KEY,original)){savedPlans=original;updateSavedCount();if($('modal').open)showSaved();}}});}
-});
-
-calculate();updateSavedCount();pressFeedback(document);introSequence(document);
-if(storageUnavailable)notify('Local saving is unavailable in this browser. You can still calculate and export plans.');
+// Bind every visible control to a complete action.
+$('#search-form').addEventListener('submit',handleSearch);
+$('#location-search').addEventListener('focus',()=>{if(!$('#location-search').value.trim())renderSearchResults(COASTAL_LOCATIONS,'EXPLORE A COAST')});
+$('#choose-location').addEventListener('click',()=>{$('#location-search').focus();renderSearchResults(COASTAL_LOCATIONS,'EXPLORE A COAST');$('#planner-panel').classList.remove('mobile-open')});
+$('#generate-plan').addEventListener('click',()=>{if(recalculate({fit:true,notify:true}))$('#planner-panel').classList.remove('mobile-open')});
+$('#area-input').addEventListener('change',()=>{const area=Number($('#area-input').value)*($('#area-unit').value==='ha'?10000:1);if(!Number.isFinite(area)||area<1||area>1e6){toast('Enter a planting area between 1 and 1,000,000 m².',true);renderControls();return}const previous=clone(state),old=state.polygon,center=centerOf(),factor=Math.sqrt(area/polygonArea(old));state.polygon=old.map(([lng,lat])=>[lngWrap(center[0]+lngWrap(lng-center[0])*factor),center[1]+(lat-center[1])*factor]);state.survey={};state.surveyDepth='';if(!recalculate({fit:true})){state=previous;recalculate();toast('That area and spacing exceed the planner limits. Increase spacing first.',true)}});
+$('#area-unit').addEventListener('change',()=>{const ha=$('#area-unit').value==='ha';$('#area-input').min=ha?.0001:1;$('#area-input').max=ha?100:1e6;$('#area-input').step=ha?.01:10;renderControls()});
+for(const [id,key] of [['spacing-input','spacing'],['coverage-input','coveragePercent'],['orientation-input','orientation'],['cost-input','unitCost'],['spares-input','sparePercent'],['plants-input','seedlingsPerStructure'],['footprint-input','footprintM2']])$('#'+id).addEventListener('input',()=>{state[key]=$('#'+id).value===''?NaN:Number($('#'+id).value);if(key==='coveragePercent'){$('#coverage-output').innerHTML=`${state.coveragePercent}<span>%</span>`;$('#coverage-input').style.background=`linear-gradient(to right,var(--teal) ${(state.coveragePercent-10)/90*100}%,#e3ebe4 ${(state.coveragePercent-10)/90*100}%)`}scheduleCalculation()});
+for(const [id,delta] of [['spacing-minus',-.1],['spacing-plus',.1]])$('#'+id).addEventListener('click',()=>{state.spacing=+Math.max(.1,(Number.isFinite(state.spacing)?state.spacing:1.5)+delta).toFixed(1);$('#spacing-input').value=state.spacing;recalculate()});
+$$('.pattern-option').forEach(b=>b.addEventListener('click',()=>{state.pattern=b.dataset.pattern;recalculate()}));
+$('#species-selector').addEventListener('click',openSpecies);$('#species-info').addEventListener('click',()=>openGuide('species'));
+$$('[data-info]').forEach(b=>b.addEventListener('click',event=>{event.preventDefault();openGuide('methods')}));
+$('#draw-area').addEventListener('click',()=>startDraw('boundary'));$('#draw-exclusion').addEventListener('click',()=>startDraw('exclusion'));$('#clear-exclusions').addEventListener('click',()=>{state.exclusions=[];state.survey={};state.surveyDepth='';recalculate();toast('Exclusions cleared. Recheck observations for the expanded usable area.')});
+$('#finish-draw').addEventListener('click',finishDraw);$('#cancel-draw').addEventListener('click',cancelMode);$('#undo-point').addEventListener('click',()=>{drawPoints.pop();renderDrawing()});
+$('#zoom-in').addEventListener('click',()=>map.zoomIn(1,{animate:false}));$('#zoom-out').addEventListener('click',()=>map.zoomOut(1,{animate:false}));$('#fit-site').addEventListener('click',fitSite);$('#brand-home').addEventListener('click',fitSite);$('#nav-planner').addEventListener('click',()=>{closeDialog();fitSite()});
+$('#locate-me').addEventListener('click',()=>{if(!navigator.geolocation){toast('Location access is not supported. Search or enter coordinates instead.',true);return}toast('Locating your position…');navigator.geolocation.getCurrentPosition(position=>chooseSearchResult({name:'My location',detail:'Device location · select the actual planting site',lat:position.coords.latitude,lng:position.coords.longitude,source:'Device location'}),()=>toast('Could not access your location. You can search or enter latitude, longitude.',true),{timeout:12000,maximumAge:60000})});
+$('#layers-button').addEventListener('click',()=>{const visible=$('#layers-popover').hidden;$('#layers-popover').hidden=!visible;$('#layers-button').setAttribute('aria-expanded',visible)});$$('[data-basemap]').forEach(b=>b.addEventListener('click',()=>setBasemap(b.dataset.basemap)));$('#show-boundary').addEventListener('change',syncLayers);$('#show-structures').addEventListener('change',syncLayers);$('#retry-map').addEventListener('click',()=>{tileFailures=0;basemap.redraw();$('#map-error').hidden=true});
+$('#survey-button').addEventListener('click',openSurvey);$('#survey-reopen').addEventListener('click',openSurvey);$('#insight-close').addEventListener('click',()=>{$('#site-insight').hidden=true;$('#survey-reopen').hidden=false});
+$('#summary-details').addEventListener('click',openCalculation);$('#save-plan').addEventListener('click',openSave);$('#nav-saved').addEventListener('click',openSaved);$('#nav-guide').addEventListener('click',()=>openGuide('methods'));$('#help-button').addEventListener('click',openHelp);
+$('#close-dialog').addEventListener('click',closeDialog);$('#app-dialog').addEventListener('click',e=>{if(e.target===$('#app-dialog')){const r=$('#app-dialog').getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)closeDialog()}});
+$('#export-button').addEventListener('click',()=>{$('#export-menu').hidden=!$('#export-menu').hidden});$$('[data-export]').forEach(b=>b.addEventListener('click',()=>exportPlan(b.dataset.export)));
+$('#mobile-plan-toggle').addEventListener('click',()=>$('#planner-panel').classList.add('mobile-open'));$('#panel-collapse').addEventListener('click',()=>$('#planner-panel').classList.remove('mobile-open'));
+document.addEventListener('click',e=>{if(!e.target.closest('.export-menu,.export-button'))$('#export-menu').hidden=true;if(!e.target.closest('.search-area,#choose-location'))$('#search-results').hidden=true;if(!e.target.closest('.layers-popover,#layers-button')){$('#layers-popover').hidden=true;$('#layers-button').setAttribute('aria-expanded','false')}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){cancelMode();$('#export-menu').hidden=true;$('#search-results').hidden=true;$('#layers-popover').hidden=true}if(e.key==='/'&&!e.target.matches('input,textarea,select')&&!$('#app-dialog').open){e.preventDefault();$('#location-search').focus()}if(e.key==='Enter'&&mode&&mode!=='place'&&!e.target.matches('input,textarea,select,button'))finishDraw()});
+window.addEventListener('resize',()=>map.invalidateSize());
+renderControls();recalculate();requestAnimationFrame(()=>fitSite());
